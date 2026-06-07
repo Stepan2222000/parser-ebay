@@ -1,0 +1,23 @@
+# Параметры парсера (SPEC §11). Подключения — в .env, не здесь.
+zip_default: "19701"
+
+poll_interval_sec: 1            # сон воркера при пустой очереди
+coordinator_poll_sec: 1         # курсор validated_items
+reparse_poll_sec: 5             # забор reparse_tasks
+cursor_overlap_sec: 60          # перекрытие курсорного запроса назад
+
+catalog_batch_size: 5           # catalog-задач на одну браузер-сессию
+catalog_throttle_threshold: 200 # item-долг, выше которого каталоги не берутся
+
+max_attempts: 3
+lease_timeout_sec: 1800
+tasks_retention_days: 14        # done/failed
+parse_errors_retention_days: 7
+
+desired_workers_default: 1      # для нового хоста без строки в worker_hosts
+shutdown_grace_sec: 120
+
+proxy:
+  enabled: false                # включается, когда в proxy-manager появится пул
+  server_url: "http://194.164.245.107:8099"
+  scope: "ebay"

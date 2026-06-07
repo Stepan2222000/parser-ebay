@@ -1,0 +1,2 @@
+asyncpg>=0.30
+pyyaml>=6
