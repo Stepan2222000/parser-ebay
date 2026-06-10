@@ -8,7 +8,7 @@ log = logging.getLogger('parser.seed')
 
 _FEED = '''
     select smart_part_id from purchase_feed(
-        p_product_types         := $1::text[],
+        p_months                := $1::int[],
         p_include_personal      := $2,
         p_include_in_transit    := $3,
         p_include_ebay_pending  := $4,
@@ -28,7 +28,7 @@ async def expand_seed(parser_conn, tb_conn, smart_conn, task) -> int:
     """
     p = json.loads(task['params'])
     feed = await tb_conn.fetch(
-        _FEED, p['product_types'],
+        _FEED, p.get('months'),
         p['include_personal'], p['include_in_transit'], p['include_ebay_pending'],
         p['include_kit_breakdown'], p['include_virtual_kit'], p['include_defect'],
         p['only_need'])

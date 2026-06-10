@@ -26,17 +26,19 @@ async def start_run(args) -> None:
     try:
         await apply_migrations(parser_conn)
 
-        # фильтр категорий валидируется по справочнику smart — опечатка падает громко
-        if args.product_types:
-            known = {r['name'] for r in await sm.fetch('select name from product_types')}
-            unknown = set(args.product_types) - known
-            if unknown:
-                raise SystemExit(
-                    f'неизвестные категории: {sorted(unknown)}; есть: {sorted(known)}')
+        # Сезонное окно — глобальная настройка ebay_to_buy (app_settings:
+        # season-filter/season-months-ahead, см. effective_season_months()).
+        # --ignore-season — разовый полный прогон без трогания настройки.
+        # Фактические месяцы фиксируем в params для трейсабилити прогона.
+        if args.ignore_season:
+            months = None
+        else:
+            months = await tb.fetchval('select effective_season_months()')
+            months = list(months) if months is not None else None
 
         params = {
             'zip': args.zip or cfg.zip_default,
-            'product_types': args.product_types or None,
+            'months': months,
             'include_personal': not args.no_include_personal,
             'include_in_transit': not args.no_include_in_transit,
             'include_ebay_pending': not args.no_include_ebay_pending,
@@ -92,8 +94,8 @@ def main() -> None:
 
     sr = sub.add_parser('start-run', help='создать run и развернуть в catalog-задачи (SPEC §4)')
     sr.add_argument('--zip', default=None, help='по умолчанию zip_default из config.yaml')
-    sr.add_argument('--product-types', nargs='*', default=None,
-                    help='фильтр категорий smart; пусто = все')
+    sr.add_argument('--ignore-season', action='store_true',
+                    help='разово игнорировать глобальный сезонный фильтр (полный фид)')
     for flag in ('include-personal', 'include-in-transit', 'include-ebay-pending',
                  'include-kit-breakdown', 'include-virtual-kit', 'include-defect',
                  'only-need'):
