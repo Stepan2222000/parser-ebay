@@ -1,0 +1,11 @@
+zip_default: "19701"
+condition_default: "new"
+mode_default: "continuous"
+catalog_refresh_sec_default: 86400   # continuous: окно свежести каталогов
+
+coordinator_poll_sec: 5     # цикл координатора
+feed_refresh_sec: 60        # кэш purchase_feed + сезонного окна
+poll_interval_sec: 1        # сон воркера при пустой очереди
+dispatch_timeout_sec: 3600  # перевыдача зависшего processing
+tasks_retention_days: 30          # done/cancelled
+parse_errors_retention_days: 14

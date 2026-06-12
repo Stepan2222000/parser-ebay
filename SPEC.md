@@ -296,8 +296,9 @@ status        # активные run, задачи по типам/статус�
 ## 9. Конфигурация
 
 - **`.env`** (не коммитится): `PARSER_DSN`, `EBAY_TO_BUY_DSN`, `SMART_DSN`,
-  `EBAY_DATA_DSN` (уходит в `ebaylib.Store`), опц. `FX_API_URL`.
-  FDW-скрипт берёт пароли из тех же env.
+  `EBAY_DATA_DSN` (уходит в `ebaylib.Store`), `VALIDATOR_DSN` (нужен только
+  FDW-скрипту), опц. `FX_API_URL`. FDW-скрипт берёт учётки и имена баз из
+  `EBAY_DATA_DSN`/`VALIDATOR_DSN`, хосты — имена контейнеров (§2).
 - **`config.yaml`** (коммитится, запекается в образ; правка = commit →
   пересборка → перезапуск, «горячей» ручки нет):
 
