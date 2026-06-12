@@ -1,9 +1,21 @@
-"""Прогон миграций (SPEC §4): применяются только руками при разработке,
-учёт — в schema_migrations. Координатор и воркеры схему не трогают."""
+"""Соединение с parser_ebay и прогон миграций (SPEC §4). Миграции
+применяются только руками при разработке, учёт — в schema_migrations;
+координатор и воркеры схему не трогают."""
+import json
 import logging
 import os
 
+import asyncpg
+
 log = logging.getLogger('parser.db')
+
+
+async def connect(dsn: str) -> asyncpg.Connection:
+    """Соединение с parser_ebay: jsonb (runs.params) ходит как dict."""
+    conn = await asyncpg.connect(dsn)
+    await conn.set_type_codec('jsonb', encoder=json.dumps, decoder=json.loads,
+                              schema='pg_catalog')
+    return conn
 
 
 async def apply_migrations(conn, base: str = 'migrations') -> int:
