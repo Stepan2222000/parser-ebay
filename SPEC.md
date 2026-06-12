@@ -42,7 +42,7 @@ IP и внешнему порту. Учётка везде `admin`, пароли
 | `EbaySession`: warmup, пагинация SRP (до 5 страниц/запрос), PDP+iframe, ZIP-флоу | `get_page`: браузер, контексты, Xvfb (позже — прокси) |
 | замена страницы при Access Denied / смерти транспорта (без лимита) | упаковка воркера в контейнер (масштабирование/рестарт — Docker/платформа, §7) |
 | конвертация цен в USD (fx), тайминги задачи (`stats.timing`) | список задач и его актуальность (координатор) |
-| запись в `ebay_data` (`Store` → `apply_catalog_fetch` / `apply_item_snapshot`) | runs (вход), CLI |
+| запись в `ebay_data` (`Store` → `apply_catalog_fetch` / `apply_item_snapshot` / `apply_item_ended` для снятых листингов) | runs (вход), CLI |
 | `e.task` — задача-виновница на исключении | сохранение HTML из `ParseError` в `parse_errors` |
 
 ## 3. Модель: журнал задач, потребности — из фактов
@@ -78,15 +78,20 @@ runs (вход: параметры) ──▶ координатор ──▶ t
   свежее порога в профиле run (zip+condition+цены)». Одна задача = одна
   деталь со ВСЕМИ её артикулами (`articles[]`) — валидатор видит деталь
   целиком, переотдача атомарна.
-- **item** (source `validator`) — «item одобрен (`status='approved'`), а
-  PDP ещё не было (`pdp_seen_at IS NULL`)». PDP делается один раз;
-  повторные — только через reparse. К run не привязан.
+- **item** (source `validator`) — «item одобрен (`status='approved'`), PDP
+  ещё не было (`pdp_seen_at IS NULL`) и item не мёртв (`NOT is_dead`)».
+  PDP делается один раз; повторные — только через reparse. К run не
+  привязан. Условие `NOT is_dead` гасит карусель завершённых листингов:
+  `fetch_item` на снятом листинге возвращает `ItemEnded`, библиотека пишет
+  `apply_item_ended` (`is_dead`, `dead_reason='ended'`, без `pdp_seen_at`) —
+  потребность исчезает с первой же записи, не дожидаясь, пока валидатор
+  отзовёт одобрение.
 - **item** (source `reparse`) — «строка `reparse_tasks` валидатора с
   `done_at IS NULL`». В `task_done` воркер ставит `done_at` — потребность
-  гаснет. `taken_at` не используем: дубль безвреден. Если на item уже есть
-  активная задача от валидатора — fingerprint совпадёт, и reparse
-  прикрепляется к ней (`ON CONFLICT … DO UPDATE SET reparse_task_id =
-  COALESCE(...)`).
+  гаснет. `taken_at` не используем: дубль безвреден. Fingerprint включает
+  `reparse_task_id`, поэтому reparse не конфликтует с возможной активной
+  валидаторской задачей на тот же item: два парсинга — две задачи, у каждой
+  свой честный `parse_ms`.
 
 ### Откуда берутся детали: фид и сезонное окно
 
@@ -119,9 +124,10 @@ season-filter / season-months-ahead, та же логика, что в UI зак
 
 ## 4. Схема базы `parser_ebay`
 
-Миграции — SQL в `migrations/`, применяются при старте (учёт в
-`schema_migrations`). FDW-объекты — отдельным идемпотентным скриптом
-(паттерн `setup_fdw.py` из ebay_data).
+Миграции — SQL в `migrations/`, применяются **только руками при разработке**
+(CLI-командой; учёт в `schema_migrations`) — ни координатор, ни воркеры
+схему не трогают. FDW-объекты — отдельным идемпотентным скриптом (паттерн
+`setup_fdw.py` из ebay_data).
 
 ### `runs` — вход системы
 
@@ -151,7 +157,7 @@ fingerprint.
 | `run_id` | bigint | catalog: чей профиль; item: NULL |
 | `source` | text | `feed` / `validator` / `reparse` |
 | `reparse_task_id` | bigint | ссылка на `reparse_tasks` валидатора |
-| `fingerprint` | text | catalog: `part_id+zip+condition+цены`; item: `item_id+zip` |
+| `fingerprint` | text | catalog: `part_id+zip+condition+цены`; item: `item_id+zip`; reparse: `+reparse_task_id` |
 | `status` | text | `pending` / `processing` / `done` / `cancelled` |
 | `attempts` | smallint | число выдач (диагностика; порога нет) |
 | `created_at` | timestamptz | |
@@ -173,24 +179,31 @@ created_at`. Retention `parse_errors_retention_days`.
 ## 5. Координатор
 
 Один активный на систему: каждый контейнер — кандидат, лидер держит
-advisory lock в `parser_ebay`; упал — лок перехватывает другой. Цикл раз в
+advisory lock в `parser_ebay`; упал — лок перехватывает другой. Ошибки —
+та же жёсткая политика, что у воркера: любая (включая недоступность
+внешних баз) валит процесс, рестарт — Docker. Цикл раз в
 `coordinator_poll_sec`:
 
-1. **Каталоги.** Для активных run: детали фида (§3, кэш `feed_refresh_sec`)
-   × несвежие по `ebay_fdw.catalog_fetches` (профиль резолвится join'ом
-   `ebay_fdw.search_profiles` по zip+condition+ценам) → INSERT pending
-   `ON CONFLICT (fingerprint) WHERE status IN ('pending','processing')
-   DO NOTHING`.
+1. **Каталоги.** Для активных run: детали фида (§3, кэш `feed_refresh_sec`,
+   вставка в порядке фида — он отсортирован по размеру нехватки, FIFO
+   сохраняет этот приоритет) × несвежие по `ebay_fdw.catalog_fetches`
+   (профиль резолвится join'ом `ebay_fdw.search_profiles` по
+   zip+condition+ценам) → INSERT pending `ON CONFLICT (fingerprint) WHERE
+   status IN ('pending','processing') DO NOTHING`. Деталь без артикулов в
+   `part_articles` пропускается с warning в лог.
 2. **Items.** `validation_fdw.validated_items` (`status='approved'`) LEFT
-   JOIN `ebay_fdw.items` WHERE `pdp_seen_at IS NULL` → INSERT pending
-   (zip — из `validated_items.context_id` → `ebay_fdw.contexts`).
+   JOIN `ebay_fdw.items` WHERE `pdp_seen_at IS NULL AND NOT
+   coalesce(is_dead, false)` → INSERT pending (zip — из
+   `validated_items.context_id` → `ebay_fdw.contexts`).
 3. **Reparse.** `validation_fdw.reparse_tasks WHERE done_at IS NULL` →
-   INSERT pending (source `reparse`, zip = `zip_default`) с прикреплением
-   к активному дублю (§3).
+   INSERT pending (source `reparse`, zip = `zip_default`); отдельная задача
+   со своим fingerprint (§3), к валидаторской не прикрепляется.
 4. **Отмена.** Pending-задачи, чья потребность исчезла: деталь ушла из
-   фида / run остановлен; item перестал быть approved (отозван валидатором)
-   → `status = 'cancelled'`, `finished_at = now()`. Processing не трогаем:
-   воркер дожуёт, лишняя запись безвредна.
+   фида / run остановлен / состав артикулов детали изменился (старый
+   `articles[]` парсил бы несуществующий артикул — следующий тик вставит
+   свежую задачу); item перестал быть approved (отозван валидатором) или
+   умер → `status = 'cancelled'`, `finished_at = now()`. Processing не
+   трогаем: воркер дожуёт, лишняя запись безвредна.
 5. **Перевыдача.** Processing с `dispatched_at < now() −
    dispatch_timeout_sec` → обратно `pending` (воркер умер или завис; если
    старый всё-таки допишет — запись идемпотентна).
