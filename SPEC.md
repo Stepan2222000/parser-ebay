@@ -1,367 +1,334 @@
-# Спецификация: парсер eBay (`parser_ebay`)
+# Спецификация: парсер eBay (`parser_ebay`) — v2
 
 ## 1. Назначение
 
-Сервис парсит eBay по артикулам запчастей: сначала каталоги (поисковая выдача, SRP),
-затем — после внешней валидации — страницы конкретных объявлений (PDP). Все факты
-складываются в базу `ebay_data` через её штатные функции; собственная база парсера
-хранит только очередь задач и служебное состояние. Парсер ничего не решает — какие
-объявления достойны детального парсинга, определяет валидатор каталога
-(`ebay_validation_catalog`); задача этой логики — только парсить.
+Оркестратор парсинга eBay по смарт-деталям: держит список того, что надо
+обработать (смарт-детали для каталогов, item'ы для PDP), и пул браузерных
+воркеров, которые это обрабатывают. Сам парсинг, конвертация цен в USD и
+запись фактов в `ebay_data` — целиком внутри библиотеки `ebaylib`
+(`run_worker` + `EbaySession` + `Store`); решения «какие item'ы достойны PDP»
+принимает внешний валидатор (`ebay_validation_catalog`). Задача этой системы —
+только сказать воркерам, ЧТО парсить, и держать это знание актуальным.
 
-Масштабирование свободное: воркеры универсальны (любой воркер берёт и каталоги,
-и items), их число меняется на лету, контейнер с воркерами разворачивается на любом
-числе серверов. Архитектура следует конвенциям платформы `server_logic`
-(очередь в своей БД, seed-задачи, адаптер-SQL, SIGTERM) — при появлении платформы
-парсер регистрируется в ней без переделки.
+Архитектура следует принципам платформы `server_logic` (DESIGN.md там):
+своя БД, вход через INSERT, воркер = будущий под, адаптер-SQL для
+backlog/скорости. До появления платформы всё управляется CLI и тонким
+супервизором.
 
 ## 2. Окружение и базы
 
-Все базы — Postgres-контейнеры на `194.164.245.107`, в docker-сети `db_default`.
-Изнутри сети видны по имени контейнера (порт 5432), снаружи — по IP и внешнему порту.
-Учётка везде `admin`, пароли в `.env`.
+Все базы — Postgres-контейнеры на `194.164.245.107`, в docker-сети
+`db_default`. Изнутри сети — по имени контейнера (порт 5432), снаружи — по IP
+и внешнему порту. Учётка везде `admin`, пароли в `.env`.
 
-| Роль | База (контейнер) | Внешний порт | Доступ |
+| Роль | База (контейнер) | Внешний порт | Кто ходит |
 |---|---|---|---|
-| Очередь и состояние парсера | `parser_ebay` | 5420 | своя, читает-пишет |
-| Источник целей закупки | `ebay_to_buy` | 5406 | только чтение (`purchase_feed`) |
-| Артикулы смарт-деталей | `smart` | 5402 | только чтение (`part_articles`) |
-| Факты eBay (каталоги, items) | `ebay_data` | 5415 | запись через функции + чтение `pdp_seen_at`, `contexts` |
-| Валидатор каталога | `ebay_validation_catalog` | 5421 | чтение `validated_items`, протокол `reparse_tasks` |
+| Наша: runs, tasks, пул, FDW-вьюхи | `parser_ebay` | 5420 | координатор, воркеры, CLI, платформа |
+| Цели закупки (`purchase_feed(...)`) | `ebay_to_buy` | 5406 | координатор (чтение) |
+| Артикулы смарт-деталей (`part_articles`) | `smart` | 5402 | координатор (чтение) |
+| Факты eBay (пишет `ebaylib.Store`) | `ebay_data` | 5415 | воркеры (через Store), у нас FDW |
+| Валидатор каталога | `ebay_validation_catalog` | 5421 | у нас FDW (чтение `validated_items`, `reparse_tasks` + UPDATE `done_at`) |
+| fx-микросервис (валюты → USD) | — | 8092 (HTTP) | библиотека сама (`FX_API_URL`) |
 
-Что именно используется у соседей:
+**FDW.** В `parser_ebay` создаётся `postgres_fdw` на `ebay_data` (схема
+`ebay_fdw`: `catalog_fetches`, `items`, `contexts`) и на
+`ebay_validation_catalog` (схема `validation_fdw`: `validated_items`,
+`reparse_tasks`). Это даёт: координатору — потребности одним SQL без
+клиентских пересечений; платформе — вьюхи «done за интервал» без
+дублирования данных (правило: чужие данные не копируем, вьюхи — можно).
+`purchase_feed` — функция, через FDW не зовётся: координатор читает
+`ebay_to_buy` и `smart` обычными соединениями.
 
-- **`ebay_to_buy.purchase_feed(...)`** — функция «что закупать»: возвращает
-  `smart_part_id`, `product_type`, `need_qty` и пр. Параметры запуска парсера
-  пробрасываются в неё как есть: `p_product_types text[]` (фильтр категорий,
-  NULL = все), include-флаги (`p_include_personal`, `p_include_in_transit`,
-  `p_include_ebay_pending`, `p_include_kit_breakdown`, `p_include_virtual_kit`,
-  `p_include_defect`), `p_only_need` (по умолчанию true).
-- **`smart.part_articles`** — `article → part_id`: канонический список артикулов
-  смарт-детали. Берутся только собственные артикулы детали; компоненты китов
-  не разворачиваются (они попадают в работу, только если сами есть в фиде).
-- **`ebay_data`** — контракт записи, вся дедупликация диффов на её стороне:
-  - `apply_catalog_fetch(p_article text, p_zip text, p jsonb)` — весь прогон
-    каталога одного артикула; payload = `dataclasses.asdict(Catalog)` из
-    `ebay-library`. Не-USD позиции парсер выкидывает из payload до вызова
-    (контракт базы: любая валюта кроме USD — исключение), их количество логируется.
-  - `apply_item_snapshot(p_zip text, p jsonb)` — один PDP-снимок; payload =
-    `asdict(ItemPage)`.
-  - `items.pdp_seen_at` — признак «PDP уже парсился» (критерий постановки item-задач).
-  - `contexts` — маппинг `context_id ↔ (marketplace, zip)`.
-  - Нарушение контракта (артикул не из smart, дубль item_id, не-USD) — громкое
-    исключение, задача уходит в `failed`, мусор в базу не пишется.
-- **`ebay_validation_catalog`** — см. её SPEC.md; парсер использует два контракта,
-  описанных там как «контракт потребителя» и «контракт парсера» (§5 настоящей спеки).
+**Распределение ролей с библиотекой `ebaylib` (v2):**
 
-Прямой связи с `ebay_validation_item` (5422) у парсера нет: тот сам читает
-`validated_items` и `ebay_data`.
+| Делает библиотека | Делает парсер |
+|---|---|
+| цикл `run_worker` («задача → парсинг → запись → task_done») | поставка задач (`next_task`) и подтверждение (`task_done`) |
+| `EbaySession`: warmup, пагинация SRP, PDP+iframe, ZIP-флоу | `get_page`: браузер, контексты, Xvfb (позже — прокси) |
+| замена страницы при Access Denied / смерти транспорта | пул воркер-процессов и их перезапуск после смерти |
+| конвертация цен в USD (fx) | список потребностей и его актуальность (координатор) |
+| запись в `ebay_data` (`Store` → `apply_catalog_fetch`/`apply_item_snapshot`) | runs (вход), CLI, FDW-вьюхи статистики |
+| `e.task` — задача-виновница на исключении при смерти | сохранение HTML из `ParseError` в `parse_errors` |
 
-## 3. Конвейер
+## 3. Модель: tasks = потребности
+
+Никакой классической очереди со статусами нет. `tasks` — это **текущий список
+того, что должно быть обработано**; координатор циклически синхронизирует его
+с реальностью, воркеры забирают и по факту записи удаляют. Факт выполнения
+живёт не у нас, а в `ebay_data` (`catalog_fetches.fetched_at`,
+`items.pdp_seen_at`) — поэтому упавшая задача никуда не теряется: её
+потребность не исчезла, координатор её снова вставит.
 
 ```
-запуск (CLI / платформа)
-   └─ seed-задача {zip, product_types[], include-флаги}
-        └─ координатор: purchase_feed → part_articles → catalog-задачи (по артикулу)
-             └─ воркер: fetch_catalog → apply_catalog_fetch → ebay_data
-                  └─ валидатор каталога (внешний, сам видит новое в ebay_data)
-                       └─ координатор: курсор по validated_items → item-задачи
-                            └─ воркер: fetch_item → apply_item_snapshot → ebay_data
-                                 └─ валидатор item (внешний, сам видит новое)
+runs (вход: параметры) ──▶ координатор ──▶ tasks (потребности) ──▶ воркеры
+                                ▲                                      │
+        purchase_feed × smart   │            ebaylib.run_worker:       │
+        свежесть: ebay_fdw      │            парсинг → Store → ebay_data
+        approved: validation_fdw└──────────── task_done → DELETE задачи
 ```
 
-Стадии самоорганизуются в одной очереди `tasks`; формального «закрытия запуска» нет:
-items текут от валидатора непрерывно, состояние видно по счётчикам очереди
-(`pending`/`done` по типам). `run_id` несут только seed- и catalog-задачи —
-для трассировки.
+### Виды потребностей
 
-### Типы задач
+- **catalog** — смарт-деталь: «по всем артикулам детали нет прогона каталога
+  свежее порога (run-профиль: zip+condition+цены)». Одна задача = одна деталь
+  со ВСЕМИ её артикулами (`articles[]`) — так валидатор видит деталь целиком,
+  а переотдача атомарна.
+- **item** (source `validator`) — «item одобрен валидатором
+  (`status='approved'`), а PDP ещё не было (`pdp_seen_at IS NULL`)».
+  PDP делается один раз; повторные — только через reparse. Не привязан к run.
+- **item** (source `reparse`) — «в `reparse_tasks` валидатора есть строка с
+  `done_at IS NULL`». После записи PDP воркер ставит `done_at` (через FDW) —
+  потребность гаснет. `taken_at` не используем (дубль безвреден, запись
+  идемпотентна).
 
-- **`seed`** — параметры запуска. Обрабатывает координатор: дергает
-  `purchase_feed(...)` в `ebay_to_buy`, по полученным `smart_part_id` читает
-  артикулы из `smart.part_articles`, вставляет catalog-задачи (идемпотентно
-  по fingerprint — повторный запуск при недоработанном прошлом безвреден:
-  активные дубли не плодятся).
-- **`catalog`** — один артикул. Воркер собирает весь каталог
-  (`fetch_catalog(page, article)` — пагинация и дедуп внутри библиотеки),
-  фильтрует не-USD, вызывает `apply_catalog_fetch`. Воркер может взять пачку
-  catalog-задач (до `catalog_batch_size`) на одну браузер-сессию —
-  внутри используется `fetch_catalogs`, упавшая подзадача не валит пачку.
-- **`item`** — один `item_id` + zip. Воркер парсит PDP (`fetch_item`),
-  вызывает `apply_item_snapshot`. Если у задачи проставлен `reparse_task_id` —
-  после успешной записи ставит `done_at` в `reparse_tasks` валидатора.
+### Свежесть каталогов и режимы
 
-## 4. Запуск
+Порог свежести задаётся режимом run:
 
-Запуск — по команде. «Запустить» = вставить seed-задачу; кто вставил — не важно:
+- `mode=once`: порог = `runs.created_at` — каждая деталь парсится один раз
+  за запуск; все спарсили → потребностей нет, run исчерпан (но активен до
+  `stop-run` — если деталь появится в фиде, она будет обработана).
+- `mode=continuous`: порог = `now() − catalog_refresh_sec` — каталоги
+  устаревают по скользящему окну и переотправляются сами; парсер крутится
+  сутками. Это «режим без конца» из server_logic §8.6.
 
-- сейчас: CLI `start_run` (точка входа в образе):
-  `start_run --zip 19701 [--product-types "Для мототехники" ...] [--no-only-need] [...]`
-  → строка в `runs` + seed-задача;
-- потом: платформа `server_logic` делает тот же INSERT из параметров запроса
-  (её штатный механизм seed), расписание — её cron.
+Деталь «свежая» ⇔ **каждый** её артикул имеет `catalog_fetches` с
+`fetched_at ≥ порога` в профиле run. Список деталей — живой: координатор
+перечитывает `purchase_feed` (раз в `feed_refresh_sec`), ушедшие из фида
+детали перестают быть потребностью в обоих режимах (закупили — парсить
+незачем), новые — появляются.
 
-Другой zip — другой запуск. Все задачи каскада наследуют zip из seed
-(item-задачи — из контекста `validated_items`).
+## 4. Схема базы `parser_ebay`
 
-## 5. Интеграция с валидатором каталога
+Миграции — SQL в `migrations/`, применяются при старте (учёт в
+`schema_migrations`). FDW-объекты — отдельным идемпотентным скриптом
+(паттерн `setup_fdw.py` из ebay_data).
 
-### 5.1 Новые PDP — курсор по `validated_items`
-
-Координатор хранит закладку в своей таблице `cursors` (имя `validator_validated_at`)
-и раз в `coordinator_poll_sec` читает:
-
-```sql
-SELECT item_id, part_id, context_id, status, validated_at
-FROM validated_items
-WHERE validated_at > %(cursor)s - interval '%(overlap)s seconds'
-ORDER BY validated_at
-```
-
-Из пришедших берутся строки `status = 'approved'`; для них батч-запросом в
-`ebay_data` проверяется `items.pdp_seen_at IS NULL` — **PDP делается один раз,
-при первом одобрении**. Прошедшие проверку становятся item-задачами
-(`ON CONFLICT (fingerprint) DO NOTHING`), закладка двигается на максимальный
-`validated_at` обработанного батча. Повторное чтение из-за перекрытия безвредно
-(fingerprint + проверка `pdp_seen_at`).
-
-`validated_at` бампается валидатором только при смене отпечатка данных — холостые
-прогоны каталога лавину повторов не создают (заложено в его дизайн). Все повторные
-PDP — только явные, через `reparse_tasks`. Отзыв одобрения (`revoked_at`) парсер
-не отслеживает: уже поставленная задача выполняется вхолостую — это дешевле логики
-отмены. Re-approve после отзыва нового PDP не порождает (pdp уже есть).
-
-### 5.2 Перепарсы — `reparse_tasks`
-
-По протоколу из спеки валидатора, раз в `reparse_poll_sec`:
-
-```sql
-UPDATE reparse_tasks SET taken_at = now()
-WHERE task_id IN (SELECT task_id FROM reparse_tasks
-                  WHERE taken_at IS NULL
-                  ORDER BY task_id LIMIT %(n)s
-                  FOR UPDATE SKIP LOCKED)
-RETURNING task_id, item_id;
-```
-
-Каждая взятая строка — item-задача с `source='reparse'` и ссылкой
-`reparse_task_id`. Если на тот же item уже есть активная задача — fingerprint
-конфликтует, тогда ссылка прикрепляется к существующей:
-`ON CONFLICT (fingerprint) WHERE active DO UPDATE
-SET reparse_task_id = COALESCE(tasks.reparse_task_id, EXCLUDED.reparse_task_id)`
-(двух активных reparse по одному item валидатор не создаёт — у него частичный
-индекс). После `apply_item_snapshot` воркер ставит `done_at = now()`.
-Потеря воркера не подвешивает задачу: наша очередь вернёт её по lease,
-`done_at` проставится при повторном выполнении.
-
-## 6. Балансировка: каталоги не убегают от items
-
-Требование: items обрабатываются как можно скорее после своего каталога;
-число обработанных каталогов не должно сильно отрываться от обработки items.
-
-Механика — приоритет при заборе задач:
-
-1. item-задачи всегда берутся раньше catalog-задач (внутри типа — FIFO по `task_id`,
-   поэтому items свежеотвалидированного каталога уходят в работу сразу);
-2. если item-долг (`count pending type='item'`) превышает
-   `catalog_throttle_threshold` — catalog-задачи не берутся вообще, воркеры
-   дренируют items.
-
-Реальная задержка «каталог → его items» определяется тиком валидатора
-(30 сек + NOTIFY на его стороне); поллинг парсера в 1 сек узким местом не является.
-
-## 7. Воркер
-
-Один воркер = один процесс = один Xvfb-дисплей = один браузер cloakbrowser =
-одна задача за раз. Параллельность наращивается числом воркеров, не контекстами
-внутри браузера (изоляция сессий, простая ротация прокси в будущем).
-
-- Браузер: `cloakbrowser.launch_async(headless=False)` на своём `DISPLAY`
-  (`:100 + slot`). Headless не используется принципиально — только headed
-  под виртуальным дисплеем.
-- Сессия живёт между задачами: `warmup(page)` один раз после запуска браузера,
-  дальше задачи идут подряд.
-- Цикл: взять задачу (§6) → выполнить → `done`/`failed` → следующая.
-  Пустая очередь — сон `poll_interval_sec`, процесс не завершается
-  (scale-to-zero — забота платформы потом).
-
-### Ошибки
-
-- `ErrorPageError`, `TimeoutError`, сетевые — транзиентные: задача возвращается
-  в `pending` (attempts++), браузер живёт дальше.
-- `AccessDeniedError` — жёсткий блок: задача в `pending`, браузер и контекст
-  пересоздаются с нуля (с прокси — это же точка `ban + rotate`).
-- `ParseError` — обязательное поле не распарсилось: задача в `failed`, HTML из
-  исключения сохраняется в `parse_errors` (gzip) для разбора; retention
-  `parse_errors_retention_days`.
-- Нарушение контракта `ebay_data` — `failed` сразу, без ретраев.
-- `attempts > max_attempts` → `failed` c `last_error`; конвейер продолжается.
-
-## 8. Схема базы `parser_ebay`
-
-Схема `public`, миграции — SQL-файлы в `migrations/`, применяются при старте
-(учёт в `schema_migrations`).
-
-### `tasks` — единая очередь
+### `runs` — вход системы
 
 | Колонка | Тип | Описание |
 |---|---|---|
-| `task_id` | bigserial PK | FIFO-порядок внутри типа |
-| `type` | text | `seed` / `catalog` / `item` |
-| `article` | text | для catalog |
-| `item_id` | bigint | для item |
-| `zip` | text | контекст eBay |
-| `params` | jsonb | для seed: параметры purchase_feed |
-| `source` | text | `cli` / `seed` / `validator` / `reparse` |
-| `reparse_task_id` | bigint | ссылка на `reparse_tasks` валидатора (item) |
-| `run_id` | bigint | трассировка (seed, catalog) |
-| `status` | text | `pending` / `processing` / `done` / `failed` |
-| `attempts` | smallint | инкремент при каждом взятии |
-| `fingerprint` | text | `md5(type:ключ:zip)`; уникальный среди активных |
-| `leased_by` | text | `host:slot` воркера |
-| `leased_at` | timestamptz | для reaper |
-| `created_at` / `started_at` / `finished_at` | timestamptz | |
-| `last_error` | text | |
+| `run_id` | bigserial PK | |
+| `params` | jsonb | zip, condition, min/max_price, product_types, include-флаги и only_need (purchase_feed), mode, catalog_refresh_sec |
+| `is_active` | boolean not null default true | false = остановлен |
+| `created_at` | timestamptz | порог свежести для `once` |
 
-Индексы: частичный `UNIQUE (fingerprint) WHERE status IN ('pending','processing')`;
-частичный `(type, task_id) WHERE status = 'pending'` (выбор задач);
-`(status, finished_at)` (адаптер-SQL и очистка).
+`start-run` = INSERT, `stop-run` = `UPDATE is_active=false` — ровно то, что
+потом будет делать платформа из `POST /run` и кнопки «Стоп» (server_logic
+§8.6). Параллельные активные run допустимы (разные профили/категории);
+пересечение потребностей гасится fingerprint'ом.
 
-Забор: `UPDATE … WHERE task_id = (SELECT … FOR UPDATE SKIP LOCKED) RETURNING` —
-семантика at-least-once, задачи идемпотентны (вся запись фактов идемпотентна
-на стороне `ebay_data`).
-
-Reaper (координатор): `processing` с `leased_at` старше `lease_timeout_sec` →
-`pending`. Задачи `done`/`failed` старше `tasks_retention_days` удаляются
-(вместе со сверкой-очисткой; партиционирование — при реальных объёмах, не сейчас).
-
-### `runs` — запуски
-
-`run_id bigserial PK`, `params jsonb` (zip, product_types, флаги),
-`articles_total int` (сколько catalog-задач породил seed), `created_at`.
-
-### `cursors` — закладки
-
-`name text PK`, `pos timestamptz`, `updated_at`. Используется:
-`validator_validated_at`.
-
-### `worker_hosts` — управление пулом
+### `tasks` — потребности
 
 | Колонка | Тип | Описание |
 |---|---|---|
-| `host` | text PK | hostname контейнера-носителя |
-| `desired_workers` | int | целевое число воркеров на хосте |
-| `updated_at` | timestamptz | |
+| `task_id` | bigserial PK | FIFO внутри типа |
+| `type` | text | `catalog` / `item` |
+| `part_id` | text | catalog: смарт-деталь |
+| `articles` | text[] | catalog: все её артикулы |
+| `item_id` | bigint | item |
+| `zip` | text | контекст |
+| `condition` | text | catalog: фильтр профиля (`all`/`new`/`used`) |
+| `min_price`, `max_price` | numeric | catalog: границы профиля (сейчас NULL) |
+| `run_id` | bigint | catalog: чей профиль; item: NULL |
+| `source` | text | `feed` / `validator` / `reparse` |
+| `reparse_task_id` | bigint | item-reparse: строка в `reparse_tasks` валидатора |
+| `fingerprint` | text UNIQUE | catalog: `part_id+zip+condition+цены`; item: `item_id+zip` |
+| `created_at` | timestamptz | |
+| `dispatched_at` | timestamptz | NULL = доступна; выдана воркеру |
+| `dispatched_to` | text | диагностика: host:slot |
 
-Число воркеров выставляется вручную (SQL или CLI `set_workers --host X N`);
-позже эту же таблицу будет крутить платформа. Супервизор нового хоста при
-отсутствии своей строки создаёт её с `desired_workers_default`.
+Статусов нет: выполнена (task_done) → DELETE. Индексы: UNIQUE (fingerprint);
+`(type, task_id) WHERE dispatched_at IS NULL` (забор).
 
-### `parse_errors` — HTML непарсящихся страниц
+### `worker_hosts` — пул (до платформы)
 
-`id bigserial PK`, `task_id bigint`, `kind text`, `html_gz bytea`, `created_at`.
+`host PK, desired_workers int, updated_at`. Меняется CLI `set-workers`;
+с приходом платформы — replicas подов, таблица отомрёт.
 
-### `schema_migrations` — `name`, `applied_at`.
+### `parse_errors` — сырьё для починки селекторов
 
-## 9. Процессы контейнера
+`id PK, task_fingerprint text, kind text, error text, html_gz bytea,
+created_at`. Retention `parse_errors_retention_days`.
 
-Контейнер один на сервер-носитель, внутри:
+### FDW-вьюхи для адаптера платформы
 
-- **Супервизор** (PID 1): раз в несколько секунд читает `worker_hosts` по своему
-  hostname и приводит пул к целевому: добавить — поднять Xvfb на свободном слоте
-  и воркер-процесс на нём; убавить — послать воркеру SIGTERM (тот дорабатывает
-  текущую задачу и гаснет вместе со своим Xvfb). SIGTERM контейнера — то же самое
-  для всех, ожидание до `shutdown_grace_sec`.
-- **Координатор** — кандидат в каждом контейнере, активен один на всю систему
-  (advisory lock в `parser_ebay`; упал носитель — лок подхватывает другой).
-  Обязанности: разворачивание seed, курсор `validated_items`, забор
-  `reparse_tasks`, reaper, очистка (`tasks`, `parse_errors`).
-- **Воркеры** — §7.
+- pending: `SELECT count(*) FROM tasks WHERE type=$1 AND dispatched_at IS NULL`
+- done за интервал: `stats_catalog_done` (view на
+  `ebay_fdw.catalog_fetches.fetched_at`), `stats_items_done` (view на
+  `ebay_fdw.items.pdp_seen_at`).
 
-## 10. Замеры-основания (прогоны 2026-06-07, сервер 2 vCPU / 3.3 GiB, без прокси)
+## 5. Координатор
 
-- cloakbrowser 0.3.31 (chromium 146) + Xvfb + ebay-library: антибот не сработал
-  ни разу; warmup 11–18 с; каталог (1 страница, 50 items) 35–45 с; PDP ~34 с.
-- Сквозной контур подтверждён вживую: `apply_catalog_fetch` →
-  `{"appeared": 50, "items_new": 50}`; валидатор подхватил каталог своим тиком
-  сам (27 approved / 23 rejected по артикулу 866148); `apply_item_snapshot`
-  принял PDP.
-- Два параллельных браузера на 2 ядрах — деградация ~×2 (упор в CPU).
-  Норма ёмкости: **1 воркер ≈ 1 ядро CPU и ~1–1.2 GiB RAM**.
-- `playwright install-deps` не знает Ubuntu 26 — системные библиотеки хромиума
-  ставятся явным списком в Dockerfile.
+Один активный на систему: каждый контейнер — кандидат, лидер берёт
+advisory lock в `parser_ebay`; упал — лок перехватывается. Цикл раз в
+`coordinator_poll_sec`:
 
-## 11. Конфигурация
+1. **Каталоги.** Для активных run: список деталей из `purchase_feed(params)`
+   (кэш на `feed_refresh_sec`) + артикулы из `smart.part_articles`; деталь
+   несвежая (см. §3) и нет строки в `tasks` → INSERT
+   (`ON CONFLICT (fingerprint) DO NOTHING`). Свежесть — одним SQL через
+   `ebay_fdw.catalog_fetches` (профиль run → `profile_id` через
+   `ebay_fdw.search_profiles`... профиль резолвится по (context, condition,
+   цены); упрощение — join по этим полям).
+2. **Items.** `validation_fdw.validated_items (status='approved')` LEFT JOIN
+   `ebay_fdw.items` ON item_id WHERE `pdp_seen_at IS NULL` → INSERT item-задач
+   (zip — из контекста `validated_items.context_id` → `ebay_fdw.contexts`).
+3. **Reparse.** `validation_fdw.reparse_tasks WHERE done_at IS NULL` →
+   INSERT item-задач (source `reparse`, zip = `zip_default`).
+4. **Чистка.** Задачи с `dispatched_at IS NULL`, чья потребность исчезла
+   (деталь стала свежей / ушла из фида / run остановлен; item получил
+   `pdp_seen_at`; reparse получил `done_at`) → DELETE. Выданные не трогаем —
+   воркер доделает, лишняя запись идемпотентна и безвредна.
+5. **Перевыдача.** `dispatched_at < now() − dispatch_timeout_sec` → сброс
+   `dispatched_at/dispatched_to` в NULL (воркер умер или завис; если он
+   всё-таки допишет — не страшно, см. выше).
+6. **Retention** `parse_errors`.
 
-Два источника, не пересекаются:
+Смерть воркера координатора не интересует — упавшие задачи возвращаются
+через потребности (п.1–3) и перевыдачу (п.5). Это замена lease+reaper из
+server_logic §9.2 с той же семантикой at-least-once.
 
-- **`.env`** — только подключения (не коммитится): `PARSER_DSN`, `EBAY_TO_BUY_DSN`,
-  `SMART_DSN`, `EBAY_DATA_DSN`, `VALIDATOR_DSN`. Локально — IP и внешние порты,
-  в проде — имена контейнеров и 5432 (`.env.example` с обоими вариантами).
-- **`config.yaml`** — параметры (коммитится), читается при старте процесса:
+## 6. Воркер
+
+Один воркер = один процесс = один Xvfb-дисплей (`:100+slot`) = один браузер
+cloakbrowser (`headless=False`) = одна задача за раз. Это будущий под
+платформы (единица мощности — воркер); ресурсный ориентир из замеров:
+~1 CPU, ~1.2 GiB RAM.
+
+Процесс запускает `ebaylib.run_worker(get_page, next_task, Store(dsn),
+task_done=...)` и реализует три колбека:
+
+- **`get_page`** — закрыть предыдущий context → новый context → новая page.
+  Зовётся библиотекой лениво и при заменах страниц (Access Denied / смерть
+  транспорта — без лимита, политика «жёстко»: темп пауз задаёт библиотека).
+  Будущая точка прокси: новый context = новая аренда из proxy-manager.
+- **`next_task`** — цикл: SIGTERM получен → вернуть `None` (библиотека
+  допишет хвост записи и штатно выйдет); иначе забор:
+
+  ```sql
+  UPDATE tasks SET dispatched_at = now(), dispatched_to = $me
+  WHERE task_id = (SELECT task_id FROM tasks
+                   WHERE dispatched_at IS NULL
+                   ORDER BY (type = 'item') DESC, task_id
+                   LIMIT 1 FOR UPDATE SKIP LOCKED)
+  RETURNING ...
+  ```
+
+  Items всегда раньше каталогов (абсолютный приоритет — «сразу после
+  каталога его item'ы», как только валидатор их пропустит), FIFO внутри
+  типа. Пусто → sleep `poll_interval_sec`, снова. Задача → формат библиотеки:
+  `{"type": "catalog", "params": {"articles": [...], "zip", "condition",
+  "min_price", "max_price"}, "task_id": N, ...}` /
+  `{"type": "item", "params": {"item_id", "zip"}, ...}` — всё вне `params`
+  библиотека вернёт в `task_done` как есть.
+- **`task_done(task, stats)`** — строго после записи в ebay_data:
+  DELETE задачи по `task_id`; для reparse — `UPDATE
+  validation_fdw.reparse_tasks SET done_at = now()`. Stats — в лог.
+
+### Смерти
+
+Любая критическая ошибка (`ParseError`, `ErrorPageError`, Pardon/iframe
+таймауты, сбой fx, сбой записи, `TaskFormatError`) валит `run_worker` —
+обёртка процесса: читает `e.task` (виновница), для `ParseError` пишет HTML в
+`parse_errors`, логирует и умирает. Супервизор поднимает новый процесс через
+`restart_delay_sec`. Висящая выдача вернётся перевыдачей (§5.5); битая задача
+будет реинкарнироваться и убивать воркеров, громко крася лог, пока не починим
+селекторы — осознанно жёсткая политика, dead-letter'а нет.
+
+## 7. Процессы контейнера
+
+Образ один; режим — env `WORKERS`:
+
+- `WORKERS=N` (под платформу: N=1) — ровно N воркер-процессов, без таблицы;
+- без `WORKERS` (дефолт, до платформы) — супервизор: читает `worker_hosts`
+  по hostname (нет строки → создаёт с `desired_workers_default`), приводит
+  пул: поднять Xvfb+воркер на свободный слот / SIGTERM лишнему (доработка
+  задачи, гашение). Перезапуск умерших — через `restart_delay_sec`.
+
+Координатор-кандидат — в каждом контейнере (лок выберет одного). SIGTERM
+контейнера → SIGTERM всем воркерам → ожидание до `shutdown_grace_sec`.
+
+## 8. Запуск и CLI
+
+```
+start-run [--zip 19701] [--condition new] [--product-types ...]
+          [--mode continuous|once] [--refresh-sec 86400]
+          [--no-include-personal ... --no-only-need]   # флаги purchase_feed
+stop-run <run_id>
+set-workers --host HOST N
+status        # активные run, потребности по типам, выданное, темп из FDW-вьюх
+```
+
+`start-run` валидирует категории по `smart.product_types` и печатает
+`run_id`. Дефолты: zip/condition/mode/refresh из `config.yaml`.
+
+## 9. Конфигурация
+
+- **`.env`** (не коммитится): `PARSER_DSN`, `EBAY_TO_BUY_DSN`, `SMART_DSN`,
+  `EBAY_DATA_DSN` (уходит в `ebaylib.Store`), опц. `FX_API_URL`.
+  FDW-пароли — в `setup_fdw`-скрипте из тех же env.
+- **`config.yaml`** (коммитится, читается при старте):
 
 ```yaml
 zip_default: "19701"
+condition_default: "new"
+mode_default: "continuous"
+catalog_refresh_sec_default: 86400   # continuous: окно свежести каталогов
 
-poll_interval_sec: 1            # сон воркера при пустой очереди
-coordinator_poll_sec: 1         # курсор validated_items
-reparse_poll_sec: 5             # забор reparse_tasks
-cursor_overlap_sec: 60          # перекрытие курсорного запроса назад
-
-catalog_batch_size: 5           # catalog-задач на одну браузер-сессию
-catalog_throttle_threshold: 200 # item-долг, выше которого каталоги не берутся
-
-max_attempts: 3
-lease_timeout_sec: 1800
-tasks_retention_days: 14        # done/failed
-parse_errors_retention_days: 7
-
-desired_workers_default: 1      # для нового хоста без строки в worker_hosts
+coordinator_poll_sec: 5     # цикл координатора
+feed_refresh_sec: 60        # кэш purchase_feed
+poll_interval_sec: 1        # сон воркера при пустых tasks
+dispatch_timeout_sec: 1800  # перевыдача зависшей выдачи
+restart_delay_sec: 5        # пауза перед перезапуском умершего воркера
 shutdown_grace_sec: 120
-
-proxy:
-  enabled: false                # включается, когда в proxy-manager появится пул
-  server_url: "http://194.164.245.107:8099"
-  scope: "ebay"
+desired_workers_default: 1
+parse_errors_retention_days: 14
 ```
+
+## 10. Интеграция с server_logic
+
+- **Вход**: INSERT в `runs` / UPDATE `is_active` — платформенный `POST /run`,
+  «Стоп»; режим «без конца» = `mode=continuous` (§8.6 DESIGN).
+- **Единица мощности — воркер**: контейнер с `WORKERS=1` = под; контроллер
+  ставит replicas, шедулер пакует по requests (~1 CPU / 1.2 GiB).
+- **Адаптер-SQL**: pending — count по `tasks` (по типам); done за интервал —
+  FDW-вьюхи `stats_catalog_done` / `stats_items_done` (факты в `ebay_data`,
+  без дублей).
+- **Идемпотентность** at-least-once: повторная запись в `ebay_data` — нулевые
+  диффы; перевыдача = аналог lease+reaper. Отступление от §9.2: dead-letter
+  по attempts нет — критические ошибки чинятся, а не прячутся.
+- Корректный SIGTERM, публичный образ — соблюдены.
+
+## 11. Замеры-основания (прогоны 2026-06-07, 2 vCPU / 3.3 GiB, без прокси)
+
+- cloakbrowser 0.3.31 + Xvfb + библиотека: антибот не сработал; warmup
+  11–18 с; каталог (страница, 50 карточек) 35–45 с; PDP ~34 с.
+- Сквозной контур жив: каталог → `ebay_data` → валидатор сам вынес вердикты
+  (27 approved / 23 rejected) → PDP записан.
+- 2 браузера на 2 ядрах — деградация ×2: **1 воркер ≈ 1 ядро + ~1.2 GiB**.
+- Ubuntu 26: системные библиотеки хромиума ставить явным списком
+  (`playwright install-deps` её не знает).
 
 ## 12. Деплой
 
-По общему шаблону `/Users/stepan/Desktop/projects/DEPLOY_TEMPLATE.md`:
-`git push main` → GHA + Docker Build Cloud → `ghcr.io/stepan2222000/parser-ebay`
-→ SSH-деплой. Каталог на сервере: `/root/parser_ebay_app`.
+По `/Users/stepan/Desktop/projects/DEPLOY_TEMPLATE.md`: GHA + Docker Build
+Cloud → `ghcr.io/stepan2222000/parser-ebay` → SSH. Каталог
+`/root/parser_ebay_app`. Образ: python 3.13+, Xvfb + библиотеки хромиума +
+шрифты, `cloakbrowser` (бинарь в build-слой через `ensure_binary()`),
+`ebay-library` (git), `asyncpg`, `pyyaml`. Тестовый сервер воркеров:
+`144.31.167.227`.
 
-Образ: python 3.13+, `cloakbrowser` (бинарь хромиума скачивается на этапе build —
-`ensure_binary()`, кэшируется слоем), `ebay-library` (git), `psycopg[binary]`,
-Xvfb + системные библиотеки хромиума + шрифты. Воркеры-носители — любые серверы
-(сейчас тест: `144.31.167.227`); базы доступны по внешним IP:порт, на
-`194.164.245.107` — через сеть `db_default`.
+## 13. Вне рамок (заделы)
 
-## 13. Интеграция с платформой `server_logic`
-
-Парсер уже соблюдает её конвенции, регистрация потом сводится к конфигу:
-
-- очередь в собственной БД, забор `FOR UPDATE SKIP LOCKED`, lease + reaper,
-  идемпотентная вставка стадий по fingerprint;
-- seed-задача как универсальный вход (INSERT из параметров запроса);
-- адаптер-SQL: backlog — `SELECT count(*) FROM tasks WHERE status='pending'`;
-  done за интервал — `SELECT count(*) FROM tasks WHERE status='done' AND
-  finished_at > now() - $1`;
-- корректный SIGTERM, образ на публичном registry;
-- управление мощностью: платформа пишет в `worker_hosts` (вместо ручного CLI)
-  и/или крутит replicas контейнеров.
-
-## 14. Вне рамок (задел на будущее)
-
-- **Прокси** — интерфейс `proxymgr` заложен (acquire на сессию воркера,
-  `report()` после каждой задачи, `ban + rotate` на `AccessDeniedError`,
-  `LeaseLost` → новая аренда); включается флагом конфига, когда пул scope `ebay`
-  будет наполнен.
-- **Фильтрация трафика / кэш (`ebay_filtering`)** — в воркере предусмотрен хук
-  route-handler на контекст браузера; жёсткий слой и адаптивный кэш подключаются
-  отдельным шагом по его спеке.
-- **Несколько zip-контекстов** — zip уже в ключах задач и параметрах запуска;
-  добавление контекста = ещё один запуск с другим zip.
-- **Принудительный refresh старых PDP** — отдельный тип задач, когда понадобится.
-- **Дашборд/метрики** — пока счётчики SQL по очереди + docker logs; метрики
-  платформы появятся с её стороны.
+- **Прокси** (proxy-manager, scope `ebay`) — точка входа готова: `get_page`;
+  включение конфигом, когда нальют пул.
+- **Фильтрация трафика / кэш** (`ebay_filtering`) — route-handler на context
+  в `get_page`, отдельным шагом.
+- **Фото** (`fetch_images` + S3) — не наша зона, ждёт фотохранилище.
+- **Сужение выдачи ценой** (`min/max_price` per-артикул из parts_prices) —
+  колонки и проброс готовы, логика потом.
+- **Несколько zip** — zip в ключах задач и параметрах run.
+- **Refresh PDP** (повторные снапшоты живых item'ов) — отдельный вид
+  потребности, когда понадобится.
+- **Дашборд** — пока `status` + SQL; далее платформа.
