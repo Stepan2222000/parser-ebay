@@ -1,2 +1,10 @@
+# координатор / CLI
 asyncpg>=0.30
 pyyaml>=6
+
+# воркер (SPEC §6, §11): браузер + библиотека парсинга + кэш/фильтрация.
+# ebay-library — пин на конкретный коммит (контракт жёсткий, bump осознанный);
+# ebay-filtering — latest.
+cloakbrowser>=0.3.31
+ebay-library @ git+https://github.com/Stepan2222000/ebay-library.git@08819ee
+ebay-filtering @ git+https://github.com/Stepan2222000/ebay_filtering.git

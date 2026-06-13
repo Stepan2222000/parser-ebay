@@ -41,7 +41,7 @@ IP и внешнему порту. Учётка везде `admin`, пароли
 | цикл `run_worker` («задача → парсинг → запись → task_done») | поставка задач (`next_task`) и подтверждение (`task_done`) |
 | `EbaySession`: warmup, пагинация SRP (до 5 страниц/запрос), PDP+iframe, ZIP-флоу | `get_page`: браузер, контексты, Xvfb (позже — прокси) |
 | замена страницы при Access Denied / смерти транспорта (без лимита) | упаковка воркера в контейнер (масштабирование/рестарт — Docker/платформа, §7) |
-| конвертация цен в USD (fx), тайминги задачи (`stats.timing`) | список задач и его актуальность (координатор) |
+| конвертация цен в USD (fx), поэтапные тайминги задачи (`stats.timing.stages` + `total_ms`) | список задач и его актуальность (координатор) |
 | запись в `ebay_data` (`Store` → `apply_catalog_fetch` / `apply_item_snapshot` / `apply_item_ended` для снятых листингов) | runs (вход), CLI |
 | `e.task` — задача-виновница на исключении | сохранение HTML из `ParseError` в `parse_errors` |
 
@@ -163,7 +163,7 @@ fingerprint.
 | `created_at` | timestamptz | |
 | `dispatched_at` | timestamptz | момент выдачи воркеру (= начало работы; основа таймаута перевыдачи) |
 | `dispatched_to` | text | кто взял: hostname контейнера воркера |
-| `parse_ms` | integer | чистое время парсинга (из `stats.timing`; запись асинхронная — в цену задачи не входит) |
+| `parse_ms` | integer | чистое время парсинга = `total_ms − write − queue` из `stats.timing` (запись асинхронная — в цену задачи не входит) |
 | `finished_at` | timestamptz | момент done/cancelled — для темпа и ретеншена |
 
 Индексы: частичный UNIQUE `(fingerprint) WHERE status IN
@@ -221,9 +221,12 @@ advisory lock в `parser_ebay`; упал — лок перехватывает �
 `ebaylib.run_worker(get_page, next_task, Store(EBAY_DATA_DSN), task_done)`
 и реализует три колбека:
 
-- **`get_page`** — закрыть предыдущий context → новый context → новая page.
-  Библиотека зовёт лениво и при заменах страниц. Будущая точка прокси:
-  новый context = новая аренда из proxy-manager.
+- **`get_page`** — закрыть предыдущий context → новый context (с прокси из
+  `EBAY_PROXY_URL`, свой на воркера; нет переменной → direct) → новая page →
+  `cache.attach` фильтрации/кэша (`ebay_filtering`, если задан
+  `EBAY_FILTERING_DSN`; best-effort — мозг лёг, страница идёт без кэша).
+  Библиотека зовёт лениво и при заменах страниц. Прокси сейчас статичный;
+  позже эту точку заменит аренда из proxy-manager (§12).
 - **`next_task`** — получен SIGTERM → вернуть `None` (библиотека допишет
   хвост записи и штатно выйдет); иначе забор, пусто → sleep
   `poll_interval_sec` и снова:
@@ -246,9 +249,14 @@ advisory lock в `parser_ebay`; упал — лок перехватывает �
   {"item_id", "zip"}, ...}` — всё вне `params` библиотека вернёт в
   `task_done` как есть.
 - **`task_done(task, stats)`** — зовётся библиотекой строго после записи в
-  `ebay_data`: `UPDATE tasks SET status='done', finished_at=now(),
-  parse_ms=$timing` по `task_id`; у reparse — ещё `UPDATE
-  validation_fdw.reparse_tasks SET done_at = now()`. `stats.db` — в лог.
+  `ebay_data`. `stats.timing` = `{started_at, total_ms, residual_ms,
+  stages{swap,nav,ready,desc,parse,queue,write}}` (поэтапные замеры
+  StageProfiler; Σstages == total_ms). Воркер пишет `UPDATE tasks SET
+  status='done', finished_at=now(), parse_ms=$1` по `task_id`, где
+  `parse_ms = total_ms − write − queue` (чистый парсинг без асинхронной
+  записи); у reparse — ещё `UPDATE validation_fdw.reparse_tasks SET done_at
+  = now()`, **оба апдейта в одной транзакции** (FDW участвует в локальной —
+  без рассинхрона при смерти). `stats.db` и поэтапные `stages` — в лог.
 
 ### Смерти
 
@@ -345,8 +353,8 @@ Cloud → `ghcr.io/stepan2222000/parser-ebay` → SSH. Каталог
 `/root/parser_ebay_app`. Образ: python 3.13+, Xvfb + библиотеки хромиума +
 шрифты, `cloakbrowser` (бинарь в build-слой через `ensure_binary()`),
 `ebay-library` — **пин на конкретный коммит/тег** (контракт жёсткий,
-обновление = осознанный bump с прогоном), `asyncpg`, `pyyaml`. Тестовый
-сервер воркеров: `144.31.167.227`.
+обновление = осознанный bump с прогоном), `ebay-filtering` (latest),
+`asyncpg`, `pyyaml`.
 
 Сетевые требования (чек-лист ввода сервера): воркеру — `parser_ebay:5420`,
 `ebay_data:5415`, fx `:8092`; координатору — те же плюс `ebay_to_buy:5406`,
@@ -354,10 +362,11 @@ Cloud → `ghcr.io/stepan2222000/parser-ebay` → SSH. Каталог
 
 ## 12. Вне рамок (заделы)
 
-- **Прокси** (proxy-manager, scope `ebay`) — точка входа: `get_page`;
-  включение конфигом, когда нальют пул.
-- **Фильтрация трафика / кэш** (`ebay_filtering`) — route-handler на context
-  в `get_page`, отдельным шагом.
+- **Прокси-сервис** (proxy-manager, scope `ebay`) — динамическая выдача из
+  пула. Сейчас прокси статичный (`EBAY_PROXY_URL`, свой на воркера); позже
+  `_proxy_cfg()` в `get_page` заменит аренда из proxy-manager.
+- **Фильтрация трафика / кэш** (`ebay_filtering`) — **подключено** в
+  `get_page` (`cache.attach`, best-effort, по `EBAY_FILTERING_DSN`).
 - **Фото** (`fetch_images` + S3) — не наша зона, ждёт фотохранилище.
 - **Сужение выдачи ценой** (`min/max_price` per-артикул из parts_prices) —
   колонки и проброс готовы, логика потом.
