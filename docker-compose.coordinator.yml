@@ -1,0 +1,15 @@
+# Координатор — синглтон на контрол-узле 194.164.245.107, в сети db_default
+# (DSN по именам контейнеров). Деплой: docker compose -f docker-compose.coordinator.yml up -d
+services:
+  coordinator:
+    image: ghcr.io/stepan2222000/parser-ebay:${IMAGE_TAG:-latest}
+    container_name: parser_ebay_coordinator
+    command: coordinator
+    restart: always
+    env_file: .env            # DSN по именам контейнеров (см. .env.coordinator.example)
+    networks:
+      - db_default            # базы видны по именам контейнеров (порт 5432)
+
+networks:
+  db_default:
+    external: true

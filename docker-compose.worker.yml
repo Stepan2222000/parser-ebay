@@ -1,0 +1,26 @@
+# Воркеры — на воркер-сервере (сейчас 2.27.20.221). Два явных сервиса, каждому
+# свой прокси (до прокси-сервиса — SPEC §12); DSN по IP. Масштаб числом воркеров —
+# зона server_logic (SPEC §10), здесь интерим-раннер на 2 воркера.
+# Деплой: docker compose -f docker-compose.worker.yml up -d
+services:
+  worker1:
+    image: ghcr.io/stepan2222000/parser-ebay:${IMAGE_TAG:-latest}
+    container_name: parser_ebay_worker1
+    command: worker
+    restart: always
+    init: true                 # tini: форвардит SIGTERM, реапит Xvfb
+    stop_grace_period: 120s     # дренаж задачи в полёте до SIGKILL (SPEC §6)
+    env_file: .env             # PARSER_DSN, EBAY_DATA_DSN, EBAY_FILTERING_DSN (по IP)
+    environment:
+      EBAY_PROXY_URL: ${WORKER1_PROXY}
+
+  worker2:
+    image: ghcr.io/stepan2222000/parser-ebay:${IMAGE_TAG:-latest}
+    container_name: parser_ebay_worker2
+    command: worker
+    restart: always
+    init: true
+    stop_grace_period: 120s
+    env_file: .env
+    environment:
+      EBAY_PROXY_URL: ${WORKER2_PROXY}

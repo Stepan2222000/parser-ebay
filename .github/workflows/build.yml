@@ -1,0 +1,45 @@
+# push в main -> Docker Build Cloud -> ghcr.io. Только СБОРКА образа; деплой — руками
+# (docker compose up на 194 / воркер-сервере). Авто-деплой/скейл — зона server_logic.
+name: build
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Docker Hub login (для Build Cloud)
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - uses: docker/setup-buildx-action@v3
+        with:
+          driver: cloud
+          endpoint: "stepanorlov/builder1"
+
+      - name: GHCR login
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ghcr.io/stepan2222000/parser-ebay:latest
+            ghcr.io/stepan2222000/parser-ebay:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
